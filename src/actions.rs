@@ -1991,11 +1991,20 @@ fn drop_for_pane(forward: &Forward, live: Option<&HashSet<String>>) -> bool {
 
 /// Listeners plus the process tree, from whichever tool the host has.
 fn snapshot(probe: &dyn HostProbe) -> std::result::Result<(Vec<Listener>, ProcessTree), String> {
-    let listeners = match probe.run(discover::LSOF_LISTENERS_COMMAND) {
-        Ok(stdout) => discover::parse_lsof(&stdout),
-        Err(lsof_err) => match probe.run(discover::SS_LISTENERS_COMMAND) {
-            Ok(stdout) => discover::parse_ss(&stdout),
-            Err(ss_err) => {
+    // `ss` is asked first, and that order is the whole point rather than a
+    // preference. Both tools exist on a Linux host often enough, and there
+    // `lsof` *succeeds* while reporting only the sockets of the user running
+    // it: a dev server another account started — a database, a broker, an
+    // agent under its own service user — is simply absent, with nothing in the
+    // output to say so. `ss` reads /proc and reports those listeners, so where
+    // it answers at all it is the complete view. Trying `lsof` first would
+    // take its success as proof it was the right tool and never reach `ss`.
+    // macOS, which has no `ss`, falls through to `lsof` on the first error.
+    let listeners = match probe.run(discover::SS_LISTENERS_COMMAND) {
+        Ok(stdout) => discover::parse_ss(&stdout),
+        Err(ss_err) => match probe.run(discover::LSOF_LISTENERS_COMMAND) {
+            Ok(stdout) => discover::parse_lsof(&stdout),
+            Err(lsof_err) => {
                 return Err(format!("lsof: {lsof_err}; ss: {ss_err}"));
             }
         },
@@ -4227,9 +4236,52 @@ mod tests {
         assert_eq!(
             commands,
             vec![
+                // `scan_ssh` stubs no `ss`, which is the macOS shape: the
+                // first attempt errors and `lsof` answers.
+                discover::SS_LISTENERS_COMMAND.to_string(),
                 discover::LSOF_LISTENERS_COMMAND.to_string(),
                 discover::PS_TREE_COMMAND.to_string(),
             ]
+        );
+    }
+
+    /// A Linux host that has both tools installed. `lsof` there answers
+    /// without error, but only about the caller's own processes, so taking its
+    /// success as the answer hides every listener another user owns — the
+    /// reason `ss` is asked first rather than second.
+    #[test]
+    fn scan_prefers_ss_when_a_host_answers_both_tools() {
+        let ssh = FakeSsh::new()
+            .with_master("buildbox.example")
+            .with_exec(
+                discover::SS_LISTENERS_COMMAND,
+                "LISTEN 0 511 0.0.0.0:5432 0.0.0.0:* users:((\"postgres\",pid=77,fd=7))\n",
+            )
+            .with_exec(discover::LSOF_LISTENERS_COMMAND, LSOF_FIELDS)
+            .with_exec(discover::PS_TREE_COMMAND, PS_PAIRS);
+        let harness = Harness::new(ssh, FakeHerdr::default(), FakePorts::default());
+        let mut e = env(vec![host("buildbox", None)]);
+        e.settings.require_pane_attribution = false;
+        let report = harness.actions(e).scan().expect("scan");
+
+        let ports: Vec<u16> = report.candidates.iter().map(|c| c.listener.port).collect();
+        assert_eq!(
+            ports,
+            vec![5432],
+            "the ss view is the one that reports another user's listener"
+        );
+        let commands: Vec<String> = harness
+            .ssh
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                SshCall::Exec(_, command) => Some(command),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !commands.contains(&discover::LSOF_LISTENERS_COMMAND.to_string()),
+            "lsof must not be consulted once ss has answered: {commands:?}"
         );
     }
 

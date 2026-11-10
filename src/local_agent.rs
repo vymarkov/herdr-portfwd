@@ -1102,10 +1102,17 @@ where
 
     /// `lsof` on macOS, `ss` on Linux, decided by asking rather than by
     /// guessing from a `uname` this crate would then have to parse.
+    ///
+    /// Asking means `ss` goes first. On Linux both tools are often present and
+    /// `lsof` answers without error while showing only the sockets of the user
+    /// running it, so its success proves nothing about it being the right
+    /// tool: every listener another account owns would silently never be
+    /// offered. `ss` reads /proc and sees them. macOS has no `ss`, so there
+    /// the first attempt errors and `lsof` answers.
     fn listeners(&mut self) -> std::result::Result<Vec<Listener>, String> {
         let order: [Probe; 2] = match self.state.probe {
-            Probe::Ss => [Probe::Ss, Probe::Lsof],
-            _ => [Probe::Lsof, Probe::Ss],
+            Probe::Lsof => [Probe::Lsof, Probe::Ss],
+            _ => [Probe::Ss, Probe::Lsof],
         };
         let mut last = String::from("no listener command succeeded");
         for probe in order {
